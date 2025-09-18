@@ -3,5 +3,24 @@
   "main": "src/worker.js",
   "compatibility_date": "2025-09-18",
   "compatibility_flags": ["nodejs_compat"],
+  // Worker runtime configuration variables
+  "vars": {
+    // If you still want to proxy to an external backend, set BACKEND_ORIGIN (no trailing slash).
+    // Leave empty or remove to run everything in this Worker.
+    "BACKEND_ORIGIN": "",
+
+    // MongoDB Atlas Data API configuration (required when running APIs directly on Workers)
+    // Example BASE: https://ap-south-1.aws.data.mongodb-api.com/app/APP_ID/endpoint/data/v1
+    "MONGODB_DATA_API_BASE": "https://REPLACE_WITH_ATLAS_DATA_API_BASE",
+    "MONGODB_DATA_SOURCE": "Cluster0",
+    "MONGODB_DATABASE": "rezulyzer",
+    "MONGODB_COLLECTION_USERS": "users",
+
+    // JWT configuration for token issuance
+    // Provide a strong secret via Wrangler secret, this inline fallback is only for local dev.
+    "JWT_ISSUER": "rezulyzer",
+    "JWT_AUDIENCE": "rezulyzer-client",
+    "JWT_EXPIRES_IN": "7d"
+  },
   "observability": { "enabled": true }
 }

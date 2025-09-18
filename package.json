@@ -49,6 +49,7 @@
     "pdfkit": "^0.17.2",
     "winston": "^3.11.0",
     "hono": "^4.6.6",
+    "jose": "^5.9.3",
     "xss-clean": "^0.1.4"
   },
   "devDependencies": {
