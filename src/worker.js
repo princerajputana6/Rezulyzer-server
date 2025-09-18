@@ -1,9 +1,22 @@
 import { Hono } from 'hono';
+import { cors } from '@hono/cors';
 
 // Minimal Worker app to enable Cloudflare Workers deployment inside server/
 // This does NOT run the Express app. Use this as a migration surface.
 
 const app = new Hono();
+
+// CORS: allow only the specified client origin
+app.use('*',
+  cors({
+    origin: 'https://rezulyzer-client.pages.dev',
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    exposeHeaders: ['Content-Length'],
+    credentials: true,
+    maxAge: 86400,
+  })
+);
 
 // Health check compatible with existing route
 app.get('/api/health', (c) => {

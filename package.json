@@ -48,6 +48,7 @@
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.17.2",
     "winston": "^3.11.0",
+    "@hono/cors": "^4.6.6",
     "hono": "^4.6.6",
     "xss-clean": "^0.1.4"
   },
