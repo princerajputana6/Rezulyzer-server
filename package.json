@@ -9,7 +9,9 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "seed": "node scripts/seed-db.js",
-    "seed:interviews": "node scripts/seed-interviews.js"
+    "seed:interviews": "node scripts/seed-interviews.js",
+    "dev:worker": "wrangler dev",
+    "deploy:worker": "wrangler deploy"
   },
   "keywords": [
     "nodejs",
@@ -46,12 +48,14 @@
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.17.2",
     "winston": "^3.11.0",
+    "hono": "^4.6.6",
     "xss-clean": "^0.1.4"
   },
   "devDependencies": {
     "@types/jest": "^29.5.8",
     "jest": "^29.7.0",
     "nodemon": "^3.0.1",
-    "supertest": "^6.3.3"
+    "supertest": "^6.3.3",
+    "wrangler": "^3.78.7"
   }
 }

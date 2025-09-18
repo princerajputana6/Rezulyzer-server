@@ -1,0 +1,7 @@
+{
+  "name": "ai-testing-portal-server",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-18",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true }
+}
