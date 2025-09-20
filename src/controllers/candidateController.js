@@ -8,7 +8,13 @@ const path = require('path');
 const fs = require('fs');
 const { validationResult } = require('express-validator');
 const s3Service = require('../services/s3Service');
-const { processResume: processResumeAI } = require('../services/resumeParserService');
+// Prefer enhanced resume parser service
+let processResumeAI;
+try {
+  ({ processResume: processResumeAI } = require('../services/newResumeParserService'));
+} catch (e) {
+  ({ processResume: processResumeAI } = require('../services/resumeParserService'));
+}
 const { sendAssessmentEmail } = require('../services/emailService');
 const aiService = require('../config/ai');
 const crypto = require('crypto');
@@ -411,13 +417,91 @@ const handleResumeUpload = async (req, res) => {
       };
     }
 
-    // Prefer AI-powered parsing for higher accuracy
+    // Prefer our unified resume parser with graceful fallback (new enhanced first)
+    let unifiedProcessResume;
+    try {
+      ({ processResume: unifiedProcessResume } = require('../services/newResumeParserService'));
+    } catch (e) {
+      ({ processResume: unifiedProcessResume } = require('../services/resumeParserService'));
+    }
     let extractedData;
     try {
-      extractedData = await processResumeAI(file.buffer, file.mimetype, file.originalname);
-    } catch (aiErr) {
-      console.warn('[WARN] AI resume parsing failed, falling back to APILayer:', aiErr.message);
-      extractedData = await parseResume(file.buffer);
+      const parsed = await unifiedProcessResume(file.buffer, file.mimetype, file.originalname);
+      if (parsed && parsed.success && parsed.data) {
+        // Legacy style: { success, data }
+        const p = parsed.data;
+        const pi = p.personalInfo || {};
+        extractedData = {
+          name: (pi.fullName || '').trim(),
+          email: (pi.email || '').trim(),
+          phone: (pi.phone || '').trim(),
+          location: (pi.location || '').trim(),
+          socialLinks: {
+            linkedin: pi.linkedin || '',
+            github: pi.github || '',
+            portfolio: pi.portfolio || ''
+          },
+          parsedProfile: p
+        };
+      } else if (parsed && (parsed.name || parsed.email || parsed.skills || parsed.experience)) {
+        // Enhanced style: direct candidate object returned
+        extractedData = parsed;
+      } else {
+        throw new Error(parsed?.error || 'Unified resume parsing failed');
+      }
+    } catch (unifiedErr) {
+      console.warn('[WARN] Unified resume parsing failed, falling back to legacy parsers:', unifiedErr.message);
+      try {
+        extractedData = await processResumeAI(file.buffer, file.mimetype, file.originalname);
+      } catch (aiErr) {
+        console.warn('[WARN] AI resume parsing failed, falling back to APILayer:', aiErr.message);
+        extractedData = await parseResume(file.buffer);
+      }
+    }
+
+    // Final sanitation: fix emails that contain leading numbers/characters and derive name if missing
+    if (extractedData) {
+      if (extractedData.email) {
+        try {
+          const m = extractedData.email.match(/[A-Za-z][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+          if (m) extractedData.email = m[0];
+          else if (extractedData.email.includes('@')) {
+            const parts = extractedData.email.split('@');
+            const local = parts[0].replace(/^[^A-Za-z]+/, '');
+            extractedData.email = `${local}@${parts[1]}`;
+          }
+        } catch {}
+      }
+      if ((!extractedData.name || !extractedData.name.trim()) && extractedData.email) {
+        try {
+          const local = extractedData.email.split('@')[0];
+          const cleaned = local.replace(/[._-]+/g, ' ').replace(/\d+/g, ' ').trim();
+          const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 4);
+          if (words.length >= 1) {
+            extractedData.name = words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+          }
+        } catch {}
+      }
+    }
+
+    // Ensure required fields are present after sanitation
+    if (!extractedData?.email || !extractedData?.name) {
+      return res.status(400).json({
+        success: false,
+        message: 'Unable to extract required details from resume. Please confirm name and email.',
+        data: {
+          suggested: {
+            name: extractedData?.name || '',
+            email: extractedData?.email || '',
+            phone: extractedData?.phone || ''
+          },
+          resumeMeta: {
+            originalName: file.originalname,
+            size: file.size,
+            type: file.mimetype
+          }
+        }
+      });
     }
 
     const existingCandidate = await Candidate.findOne({
@@ -433,8 +517,266 @@ const handleResumeUpload = async (req, res) => {
       });
     }
 
+    // Prefer hydrating from OpenResume raw JSON if available
+    const or = extractedData.openResumeProfile || null;
+    const pp = extractedData.parsedProfile || null;
+    let hydrated = { ...extractedData };
+
+    if (or) {
+      const personal = or.personal || or.basics || or.profile || {};
+      const work = Array.isArray(or.work || or.experience || or.experiences) ? (or.work || or.experience || or.experiences) : [];
+      const education = Array.isArray(or.education) ? or.education : [];
+      const skills = Array.isArray(or.skills) ? or.skills : [];
+      const projects = Array.isArray(or.projects) ? or.projects : [];
+      const certifications = Array.isArray(or.certifications || or.awards) ? (or.certifications || or.awards) : [];
+      const languages = Array.isArray(or.languages) ? or.languages : [];
+      const publications = Array.isArray(or.publications) ? or.publications : [];
+      const volunteering = Array.isArray(or.volunteering) ? or.volunteering : [];
+
+      hydrated.name = hydrated.name || (personal.name || `${personal.firstName || ''} ${personal.lastName || ''}`.trim());
+      hydrated.email = hydrated.email || personal.email || '';
+      hydrated.phone = hydrated.phone || personal.phone || personal.phoneNumber || '';
+      hydrated.location = hydrated.location || personal.address?.city || '';
+      hydrated.linkedinUrl = hydrated.linkedinUrl || personal.profiles?.linkedin || personal.linkedin || '';
+      hydrated.portfolioUrl = hydrated.portfolioUrl || personal.website || personal.url || '';
+
+      hydrated.summary = hydrated.summary || or.summary || personal.summary || personal.objective || '';
+
+      hydrated.currentPosition = hydrated.currentPosition || {};
+      hydrated.currentPosition.title = hydrated.currentPosition.title || (work[0]?.position || work[0]?.title || '');
+      hydrated.currentPosition.company = hydrated.currentPosition.company || (work[0]?.company || '');
+
+      hydrated.experience = work.map(w => ({
+        title: w.position || w.title || '',
+        company: w.company || '',
+        location: w.location || w.city || '',
+        startDate: w.startDate || w.start ? new Date(w.startDate || w.start) : null,
+        endDate: w.endDate || w.end ? new Date(w.endDate || w.end) : null,
+        current: !(w.endDate || w.end),
+        description: w.summary || '',
+        achievements: Array.isArray(w.achievements) ? w.achievements : [],
+      }));
+
+      hydrated.education = education.map(ed => ({
+        degree: ed.degree || ed.studyType || '',
+        institution: ed.institution || ed.school || ed.university || '',
+        location: ed.location || '',
+        startDate: ed.startDate ? new Date(ed.startDate) : null,
+        endDate: (ed.endDate || ed.graduationDate || ed.date) ? new Date(ed.endDate || ed.graduationDate || ed.date) : null,
+        gpa: ed.gpa || '',
+        achievements: Array.isArray(ed.honors) ? ed.honors : [],
+      }));
+
+      const techKeywords = skills.flatMap(s => s.keywords || s.items || []).filter(Boolean);
+      hydrated.skills = {
+        technical: techKeywords.map(k => ({ name: k, level: 'Intermediate', years: 0 })),
+        soft: []
+      };
+
+      hydrated.certifications = certifications.map(c => ({
+        name: c.title || c.name || '',
+        issuer: c.issuer || c.awarder || '',
+        issueDate: c.date ? new Date(c.date) : null,
+        expiryDate: null,
+        credentialId: ''
+      }));
+
+      hydrated.projects = projects.map(p => ({
+        name: p.name || p.title || '',
+        description: p.description || '',
+        technologies: Array.isArray(p.technologies || p.keywords || p.tools) ? (p.technologies || p.keywords || p.tools) : [],
+        url: p.url || p.link || '',
+        startDate: null,
+        endDate: null,
+      }));
+
+      // Populate fully remodeled OpenResume-shaped field for first-class usage
+      hydrated.openResumeData = {
+        basics: {
+          name: personal.name || `${personal.firstName || ''} ${personal.lastName || ''}`.trim(),
+          firstName: personal.firstName || '',
+          lastName: personal.lastName || '',
+          email: personal.email || '',
+          phone: personal.phone || personal.phoneNumber || '',
+          address: {
+            streetAddress: personal.address?.streetAddress || personal.address?.street || '',
+            city: personal.address?.city || '',
+            region: personal.address?.region || personal.address?.state || '',
+            postalCode: personal.address?.postalCode || personal.address?.zip || '',
+            country: personal.address?.country || '',
+          },
+          profiles: {
+            linkedin: personal.profiles?.linkedin || personal.linkedin || '',
+            github: personal.profiles?.github || personal.github || '',
+            portfolio: personal.website || personal.url || '',
+            website: personal.website || '',
+            other: []
+          },
+          summary: or.summary || personal.summary || '',
+          objective: personal.objective || ''
+        },
+        work: work.map(w => ({
+          company: w.company || '',
+          position: w.position || '',
+          title: w.title || '',
+          location: w.location || w.city || '',
+          startDate: w.startDate || w.start ? new Date(w.startDate || w.start) : null,
+          endDate: w.endDate || w.end ? new Date(w.endDate || w.end) : null,
+          isCurrent: !(w.endDate || w.end),
+          summary: w.summary || '',
+          highlights: Array.isArray(w.highlights) ? w.highlights : [],
+          technologies: Array.isArray(w.technologies) ? w.technologies : [],
+          tools: Array.isArray(w.tools) ? w.tools : [],
+          teamSize: w.teamSize || '',
+          reportingTo: w.reportingTo || ''
+        })),
+        education: education.map(ed => ({
+          institution: ed.institution || ed.school || ed.university || '',
+          school: ed.school || '',
+          university: ed.university || '',
+          degree: ed.degree || '',
+          studyType: ed.studyType || '',
+          field: ed.field || '',
+          area: ed.area || '',
+          location: ed.location || '',
+          startDate: ed.startDate ? new Date(ed.startDate) : null,
+          endDate: ed.endDate ? new Date(ed.endDate) : null,
+          graduationDate: ed.graduationDate ? new Date(ed.graduationDate) : (ed.date ? new Date(ed.date) : null),
+          gpa: ed.gpa || '',
+          courses: Array.isArray(ed.courses) ? ed.courses : [],
+          honors: Array.isArray(ed.honors) ? ed.honors : []
+        })),
+        skills: skills.map(s => ({
+          name: s.name || s.label || '',
+          level: s.level || '',
+          keywords: Array.isArray(s.keywords) ? s.keywords : [],
+          items: Array.isArray(s.items) ? s.items : []
+        })),
+        projects: projects.map(p => ({
+          name: p.name || p.title || '',
+          title: p.title || '',
+          description: p.description || '',
+          url: p.url || '',
+          link: p.link || '',
+          keywords: Array.isArray(p.keywords) ? p.keywords : [],
+          technologies: Array.isArray(p.technologies) ? p.technologies : [],
+          tools: Array.isArray(p.tools) ? p.tools : [],
+          achievements: Array.isArray(p.achievements) ? p.achievements : [],
+          startDate: p.startDate ? new Date(p.startDate) : null,
+          endDate: p.endDate ? new Date(p.endDate) : null
+        })),
+        certifications: certifications.map(c => ({
+          name: c.name || c.title || '',
+          title: c.title || '',
+          issuer: c.issuer || c.awarder || '',
+          awarder: c.awarder || '',
+          date: c.date ? new Date(c.date) : null,
+          url: c.url || '',
+          credentialId: c.credentialId || ''
+        })),
+        languages: languages.map(l => ({
+          language: l.language || l.name || '',
+          proficiency: l.proficiency || ''
+        })),
+        publications: publications.map(p => ({
+          title: p.title || '',
+          journal: p.journal || '',
+          date: p.date ? new Date(p.date) : null,
+          authors: Array.isArray(p.authors) ? p.authors : [],
+          url: p.url || ''
+        })),
+        volunteering: volunteering.map(v => ({
+          organization: v.organization || '',
+          role: v.role || '',
+          duration: v.duration || '',
+          description: v.description || ''
+        })),
+        additionalInfo: {
+          availability: '',
+          noticePeriod: '',
+          expectedSalary: '',
+          willingToRelocate: '',
+          visaStatus: '',
+          references: [],
+          hobbies: [],
+          interests: []
+        }
+      };
+    } else if (pp) {
+      // Basic header overrides if missing
+      hydrated.name = hydrated.name || pp.personalInfo?.fullName || '';
+      hydrated.email = hydrated.email || pp.personalInfo?.email || '';
+      hydrated.phone = hydrated.phone || pp.personalInfo?.phone || '';
+      hydrated.location = hydrated.location || pp.personalInfo?.location || '';
+      hydrated.linkedinUrl = hydrated.linkedinUrl || pp.personalInfo?.linkedin || '';
+      hydrated.portfolioUrl = hydrated.portfolioUrl || pp.personalInfo?.portfolio || '';
+
+      // Summary
+      hydrated.summary = pp.professionalSummary || hydrated.summary || '';
+
+      // Current position
+      const co = pp.careerOverview || {};
+      hydrated.currentPosition = hydrated.currentPosition || {};
+      hydrated.currentPosition.title = hydrated.currentPosition.title || co.currentRole || '';
+      hydrated.currentPosition.company = hydrated.currentPosition.company || co.currentCompany || '';
+
+      // Experience
+      const px = Array.isArray(pp.workExperience) ? pp.workExperience : [];
+      hydrated.experience = px.map(exp => ({
+        title: exp.position || '',
+        company: exp.company || '',
+        location: exp.location || '',
+        startDate: exp.startDate || null,
+        endDate: exp.endDate || null,
+        current: !!exp.isCurrentJob,
+        description: exp.description || '',
+        achievements: Array.isArray(exp.achievements) ? exp.achievements : [],
+      }));
+
+      // Education
+      const pe = Array.isArray(pp.education) ? pp.education : [];
+      hydrated.education = pe.map(ed => ({
+        degree: ed.degree || '',
+        institution: ed.institution || '',
+        location: ed.location || '',
+        startDate: ed.startDate || null,
+        endDate: ed.endDate || null,
+        gpa: ed.gpa || '',
+        achievements: Array.isArray(ed.honors) ? ed.honors : [],
+      }));
+
+      // Skills
+      const ps = pp.skills || {};
+      const technical = Array.isArray(ps.technical) ? ps.technical : [];
+      hydrated.skills = {
+        technical: technical.map(t => ({ name: t.name || t, level: t.level || 'Proficient', years: t.years || 0 })),
+        soft: Array.isArray(ps.soft) ? ps.soft : []
+      };
+
+      // Certifications
+      const pc = Array.isArray(pp.certifications) ? pp.certifications : [];
+      hydrated.certifications = pc.map(cert => ({
+        name: cert.name || '',
+        issuer: cert.issuer || '',
+        issueDate: cert.dateObtained || null,
+        expiryDate: cert.expiryDate || null,
+        credentialId: cert.credentialId || ''
+      }));
+
+      // Projects
+      const pj = Array.isArray(pp.projects) ? pp.projects : [];
+      hydrated.projects = pj.map(proj => ({
+        name: proj.name || '',
+        description: proj.description || '',
+        technologies: Array.isArray(proj.technologies) ? proj.technologies : [],
+        url: proj.url || '',
+        startDate: proj.startDate || null,
+        endDate: proj.endDate || null,
+      }));
+    }
+
     const candidateData = {
-      ...extractedData,
+      ...hydrated,
       companyId,
       resumeInfo: {
         fileName: uploadResult.s3Key,
@@ -745,34 +1087,85 @@ const uploadResume = [upload.single('resume'), handleResumeUpload];
 // @route   POST /api/candidates/:id/send-assessment
 // @access  Private (Company)
 const sendAssessment = async (req, res) => {
+  const startTime = Date.now();
+  
   try {
+    console.log(`[PERF] Starting sendAssessment for candidate ${req.params.id}`);
+    
     const mongoose = require('mongoose');
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Invalid candidate ID' });
     }
+    
+    console.log(`[PERF] Validation completed in ${Date.now() - startTime}ms`);
+    
     const candidate = await Candidate.findById(req.params.id);
     if (!candidate) {
       return res.status(404).json({ success: false, message: 'Candidate not found' });
     }
+    
+    console.log(`[PERF] Database query completed in ${Date.now() - startTime}ms`);
 
-    // Generate a random password
-    const password = crypto.randomBytes(8).toString('hex');
-    candidate.password = password;
-    await candidate.save();
-
-    // Build login URL with latest assigned testId if present
-    let latestTestId = null;
-    if (candidate.assignedTests && candidate.assignedTests.length > 0) {
-      const sorted = candidate.assignedTests
-        .slice()
-        .sort((a, b) => new Date(b.assignedAt || 0) - new Date(a.assignedAt || 0));
-      latestTestId = sorted[0].testId?.toString();
+    // Check if candidate already has pending tests
+    const pendingTests = candidate.assignedTests?.filter(test => test.status === 'pending') || [];
+    
+    if (pendingTests.length === 0) {
+      // No pending tests, let's assign a default test
+      console.log(`[INFO] No pending tests found for candidate. Looking for available tests...`);
+      
+      const Test = require('../models/Test');
+      const companyId = req.user.companyId || req.user._id;
+      
+      // Find an available test for this company (or a general test)
+      const availableTest = await Test.findOne({
+        $or: [
+          { createdBy: companyId },
+          { isPublic: true },
+          { status: 'published' }
+        ]
+      }).sort({ createdAt: -1 });
+      
+      if (availableTest) {
+        console.log(`[INFO] Found available test: ${availableTest.title}`);
+        
+        // Assign the test to the candidate
+        candidate.assignedTests = candidate.assignedTests || [];
+        candidate.assignedTests.push({
+          testId: availableTest._id,
+          assignedBy: req.user._id,
+          assignedAt: new Date(),
+          status: 'pending'
+        });
+        
+        console.log(`[INFO] Assigned test ${availableTest.title} to candidate ${candidate.name}`);
+      } else {
+        console.warn(`[WARN] No available tests found for candidate ${candidate.name}`);
+        return res.status(400).json({
+          success: false,
+          message: 'No tests available to assign. Please create a test first.'
+        });
+      }
+    } else {
+      console.log(`[INFO] Candidate already has ${pendingTests.length} pending test(s)`);
     }
-    const baseClient = process.env.CLIENT_URL || 'http://localhost:3000';
-    const loginUrl = latestTestId
-      ? `${baseClient}/assessment-login?testId=${latestTestId}`
-      : `${baseClient}/assessment-login`;
 
+    // Generate a random password and assessment token
+    const password = crypto.randomBytes(8).toString('hex');
+    const assessmentToken = crypto.randomBytes(32).toString('hex'); // Unique token for this assessment
+    
+    candidate.assessmentPassword = password;
+    candidate.assessmentToken = assessmentToken;
+    candidate.assessmentTokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days expiry
+    await candidate.save();
+    
+    console.log(`[PERF] Password and token generation completed in ${Date.now() - startTime}ms`);
+
+    // Create assessment login URL with candidate token
+    const baseClient = process.env.CLIENT_URL || 'http://localhost:3000';
+    const loginUrl = `${baseClient}/assessment-login?token=${assessmentToken}`;
+
+    console.log(`[PERF] Starting email send at ${Date.now() - startTime}ms`);
+    
     // Send the assessment email
     await sendAssessmentEmail(candidate.email, {
       candidateName: candidate.name,
@@ -781,16 +1174,182 @@ const sendAssessment = async (req, res) => {
       password: password,
       loginUrl
     });
+    
+    console.log(`[PERF] Email sent successfully in ${Date.now() - startTime}ms`);
 
     res.json({
       success: true,
-      message: 'Assessment invitation sent successfully'
+      message: 'Assessment invitation sent successfully',
+      processingTime: `${Date.now() - startTime}ms`
     });
   } catch (error) {
     console.error('Send assessment error:', error);
+    console.log(`[PERF] Error occurred after ${Date.now() - startTime}ms`);
     res.status(500).json({
       success: false,
-      message: 'Server error while sending assessment'
+      message: 'Server error while sending assessment',
+      error: error.message,
+      processingTime: `${Date.now() - startTime}ms`
+    });
+  }
+};
+
+// @desc    Validate assessment token and get candidate info
+// @route   GET /api/candidates/assessment/validate/:token
+// @access  Public (for assessment login)
+const validateAssessmentToken = async (req, res) => {
+  try {
+    const { token } = req.params;
+    
+    console.log(`[DEBUG] Token validation request for token: ${token?.substring(0, 16)}...`);
+    
+    if (!token) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Assessment token is required' 
+      });
+    }
+
+    // Find candidate by token and check if token is not expired
+    const candidate = await Candidate.findOne({
+      assessmentToken: token,
+      assessmentTokenExpiry: { $gt: new Date() }
+    });
+
+    console.log(`[DEBUG] Token validation result: ${candidate ? 'Found candidate' : 'No candidate found'}`);
+    
+    if (candidate) {
+      console.log(`[DEBUG] Candidate: ${candidate.name}, Token expiry: ${candidate.assessmentTokenExpiry}`);
+      console.log(`[DEBUG] Assigned tests: ${candidate.assignedTests?.length || 0}`);
+    } else {
+      // Let's check if the token exists but is expired
+      const expiredCandidate = await Candidate.findOne({ assessmentToken: token });
+      if (expiredCandidate) {
+        console.log(`[DEBUG] Token found but expired. Expiry was: ${expiredCandidate.assessmentTokenExpiry}`);
+        return res.status(404).json({ 
+          success: false, 
+          message: 'Assessment token has expired. Please request a new assessment invitation.' 
+        });
+      } else {
+        console.log(`[DEBUG] Token not found in database`);
+        return res.status(404).json({ 
+          success: false, 
+          message: 'Invalid assessment token. Please check your assessment link.' 
+        });
+      }
+    }
+
+    // Populate the assigned tests with test details
+    await candidate.populate('assignedTests.testId', 'title description duration questions');
+
+    // Get pending tests for this candidate and normalize shape
+    const pendingTestsRaw = Array.isArray(candidate.assignedTests)
+      ? candidate.assignedTests.filter(t => t && t.status === 'pending')
+      : [];
+
+    const pendingTests = pendingTestsRaw
+      .map(t => {
+        const ref = t.testId;
+        const id = ref && typeof ref === 'object' ? (ref._id || ref.id) : ref;
+        const title = ref && typeof ref === 'object' ? (ref.title || null) : null;
+        if (!id) {
+          console.warn('[DEBUG] Skipping pending test with invalid testId reference', {
+            candidateId: candidate._id?.toString(),
+            assignedAt: t.assignedAt,
+          });
+          return null;
+        }
+        return {
+          testId: id.toString(),
+          title,
+          status: t.status,
+          assignedAt: t.assignedAt,
+          dueDate: t.dueDate || null,
+        };
+      })
+      .filter(Boolean);
+
+    res.json({
+      success: true,
+      data: {
+        candidateId: candidate._id,
+        name: candidate.name,
+        email: candidate.email,
+        pendingTests: pendingTests,
+        hasAssessmentPassword: !!candidate.assessmentPassword,
+        tokenExpiry: candidate.assessmentTokenExpiry
+      }
+    });
+
+  } catch (error) {
+    console.error('Validate assessment token error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while validating assessment token'
+    });
+  }
+};
+
+// @desc    Authenticate candidate for assessment
+// @route   POST /api/candidates/assessment/login
+// @access  Public (for assessment login)
+const assessmentLogin = async (req, res) => {
+  try {
+    const { token, email, password } = req.body;
+
+    if (!token || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token, email, and password are required'
+      });
+    }
+
+    // Find candidate by token
+    const candidate = await Candidate.findOne({
+      assessmentToken: token,
+      assessmentTokenExpiry: { $gt: new Date() },
+      email: email.toLowerCase()
+    });
+
+    if (!candidate) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials or expired token'
+      });
+    }
+
+    // Check password
+    if (candidate.assessmentPassword !== password) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Generate a session token for the assessment (different from the invitation token)
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    
+    // Store session info (you might want to use Redis or a separate session store)
+    candidate.assessmentSessionToken = sessionToken;
+    candidate.assessmentSessionExpiry = new Date(Date.now() + 4 * 60 * 60 * 1000); // 4 hours
+    await candidate.save();
+
+    res.json({
+      success: true,
+      message: 'Authentication successful',
+      data: {
+        sessionToken,
+        candidateId: candidate._id,
+        name: candidate.name,
+        email: candidate.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Assessment login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during authentication'
     });
   }
 };
@@ -805,5 +1364,7 @@ module.exports = {
   downloadResume,
   getCandidateStats,
   sendAssessment,
-  generateAssessment
+  generateAssessment,
+  validateAssessmentToken,
+  assessmentLogin
 };

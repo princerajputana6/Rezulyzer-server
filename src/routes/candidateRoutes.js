@@ -10,7 +10,9 @@ const {
   downloadResume,
   getCandidateStats,
   sendAssessment,
-  generateAssessment
+  generateAssessment,
+  validateAssessmentToken,
+  assessmentLogin
 } = require('../controllers/candidateController');
 const { protect, authorize } = require('../middleware/auth');
 
@@ -73,5 +75,12 @@ router.route('/:id/send-assessment')
 // AI-generated assessment from candidate resume/profile
 router.route('/:id/generate-assessment')
   .post(protect, generateAssessment);
+
+// Public assessment routes (no authentication required)
+router.route('/assessment/validate/:token')
+  .get(validateAssessmentToken);
+
+router.route('/assessment/login')
+  .post(assessmentLogin);
 
 module.exports = router;

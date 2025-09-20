@@ -5,8 +5,9 @@ const TestAttempt = require('../models/TestAttempt');
 const TestInvitation = require('../models/TestInvitation');
 const Question = require('../models/Question');
 const AuditLog = require('../models/AuditLog');
-const { generateQuestions, analyzeResume } = require('../config/ai');
-const { sendEmail } = require('../config/email');
+const ScheduledJob = require('../models/ScheduledJob');
+const aiService = require('../config/ai');
+const { sendAssessmentEmail } = require('../services/emailService');
 const PDFDocument = require('pdfkit');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { HTTP_STATUS, MESSAGES } = require('../utils/constants');
@@ -361,6 +362,16 @@ const startTestAttempt = asyncHandler(async (req, res) => {
 
   // If an attempt already exists for this user+test, reuse it (unique index constraint)
   const existing = await TestAttempt.findOne({ testId: test._id, userId: req.user.id });
+  try {
+    console.log('[ATTEMPT_DEBUG][start]', {
+      userId: req.user.id,
+      role: req.user.role || req.userRole,
+      hasExisting: !!existing,
+      existingId: existing?._id?.toString(),
+      existingUser: existing?.userId?.toString(),
+      testId: test._id.toString(),
+    });
+  } catch {}
   if (existing) {
     if (existing.status === 'completed') {
       return res.status(HTTP_STATUS.BAD_REQUEST).json(
@@ -386,6 +397,13 @@ const startTestAttempt = asyncHandler(async (req, res) => {
       startedAt: new Date(),
       expiresAt: new Date(Date.now() + test.duration * 60 * 1000)
     });
+    try {
+      console.log('[ATTEMPT_DEBUG][created]', {
+        attemptId: attempt._id.toString(),
+        userId: attempt.userId.toString(),
+        reqUserId: req.user.id,
+      });
+    } catch {}
     return res.status(HTTP_STATUS.CREATED).json(
       createSuccessResponse('Test attempt started', { attempt })
     );
@@ -413,6 +431,15 @@ const submitAnswer = asyncHandler(async (req, res) => {
       createErrorResponse('Test attempt not found')
     );
   }
+
+  try {
+    console.log('[ATTEMPT_DEBUG][answer]', {
+      attemptId: attempt._id.toString(),
+      attemptUser: attempt.userId?.toString(),
+      reqUserId: req.user.id,
+      role: req.user.role || req.userRole,
+    });
+  } catch {}
 
   if (attempt.userId.toString() !== req.user.id) {
     return res.status(HTTP_STATUS.FORBIDDEN).json(
@@ -636,7 +663,78 @@ const generateAIQuestions = asyncHandler(async (req, res) => {
 // @route   POST /api/tests/:id/invite
 // @access  Private
 const sendTestInvitations = asyncHandler(async (req, res) => {
-  res.json(createSuccessResponse('Invitations sent successfully'));
+  const testId = req.params.id;
+  const { emails = [], scheduleAt, message } = req.body || {};
+
+  const test = await Test.findById(testId).populate('createdBy', 'firstName lastName email');
+  if (!test) {
+    return res.status(HTTP_STATUS.NOT_FOUND).json(createErrorResponse('Test not found'));
+  }
+
+  // Determine recipients: if not provided, derive from candidates assigned to test creator's company (future enhancement)
+  if (!Array.isArray(emails) || emails.length === 0) {
+    return res.status(HTTP_STATUS.BAD_REQUEST).json(createErrorResponse('No recipient emails provided'));
+  }
+
+  // If scheduled in future, create ScheduledJob for Cloudflare cron to pick up
+  const now = new Date();
+  const when = scheduleAt ? new Date(scheduleAt) : now;
+
+  if (when > now) {
+    await ScheduledJob.create({
+      type: 'invite_test',
+      payload: { testId, emails, message, loginBaseUrl: process.env.CLIENT_URL },
+      scheduledAt: when,
+      companyId: test.companyId || undefined,
+      createdBy: req.user.id
+    });
+
+    await AuditLog.create({
+      userId: req.user.id,
+      action: 'test_invite_scheduled',
+      resourceType: 'Test',
+      resourceId: test._id,
+      details: { emailsCount: emails.length, scheduleAt: when.toISOString() },
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
+    return res.json(createSuccessResponse('Invitations scheduled', { scheduledAt: when.toISOString() }));
+  }
+
+  // Immediate send via nodemailer
+  const base = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+  const loginUrl = `${base}/assessment-login`;
+  const companyName = `${test.createdBy?.firstName || ''} ${test.createdBy?.lastName || ''}`.trim() || 'Your Company';
+
+  let sent = 0;
+  for (const email of emails) {
+    try {
+      await sendAssessmentEmail(email, {
+        candidateName: email.split('@')[0],
+        companyName,
+        email,
+        password: 'Use link to login',
+        loginUrl,
+        message
+      });
+      sent += 1;
+    } catch (e) {
+      logger.warn(`Invite failed for ${email}: ${e.message}`);
+    }
+  }
+
+  await AuditLog.create({
+    userId: req.user.id,
+    action: 'test_invite_sent',
+    resourceType: 'Test',
+    resourceId: test._id,
+    details: { emailsCount: sent },
+    ipAddress: req.ip,
+    userAgent: req.get('User-Agent')
+  });
+
+  return res.json(createSuccessResponse('Invitations sent successfully', { sent }));
 });
 
 // @desc    Get test invitations

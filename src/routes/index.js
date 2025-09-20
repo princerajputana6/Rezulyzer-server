@@ -4,6 +4,8 @@ const testRoutes = require('./tests');
 const userRoutes = require('./users');
 const aiRoutes = require('./ai');
 const reportRoutes = require('./reports');
+const jdRoutes = require('./jd');
+const schedulerRoutes = require('./scheduler');
 
 const router = express.Router();
 
@@ -23,5 +25,7 @@ router.use('/tests', testRoutes);
 router.use('/users', userRoutes);
 router.use('/ai', aiRoutes);
 router.use('/reports', reportRoutes);
+router.use('/jd', jdRoutes);
+router.use('/scheduler', schedulerRoutes);
 
 module.exports = router;

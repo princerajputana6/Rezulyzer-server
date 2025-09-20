@@ -17,15 +17,26 @@ const createTransporter = () => {
     });
   }
 
-  // Fallback: Ethereal (dev preview) if no SMTP configured
-  return nodemailer.createTransport({
-    host: 'smtp.ethereal.email',
-    port: 587,
-    auth: {
-      user: 'ethereal.user@ethereal.email',
-      pass: 'ethereal.pass'
+  // Fallback: Use Gmail SMTP for development (you'll need to set up app password)
+  // Or return a mock transporter that just logs emails
+  console.warn('⚠️  No SMTP configuration found. Using mock email service.');
+  
+  return {
+    verify: async () => Promise.resolve(true),
+    sendMail: async (mailOptions) => {
+      console.log('\n📧 MOCK EMAIL SENT:');
+      console.log('To:', mailOptions.to);
+      console.log('Subject:', mailOptions.subject);
+      console.log('Content:', mailOptions.html ? 'HTML content available' : mailOptions.text);
+      console.log('========================\n');
+      
+      return { 
+        messageId: `mock-${Date.now()}@localhost`,
+        accepted: [mailOptions.to],
+        rejected: []
+      };
     }
-  });
+  };
 };
 
 // Email templates

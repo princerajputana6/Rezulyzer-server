@@ -92,6 +92,50 @@ function safeString(v) { return (v || '').toString().trim(); }
 function safeArray(arr, defaultValue = []) { return Array.isArray(arr) ? arr : defaultValue; }
 function safeObject(obj, defaultValue = {}) { return (obj && typeof obj === 'object') ? obj : defaultValue; }
 
+// -------- Helpers for dates, durations and years extraction --------
+function parseDateFlexible(input) {
+  if (!input) return null;
+  const s = safeString(input)
+    .replace(/\b(present|current)\b/i, new Date().toISOString())
+    .replace(/\bsept\b/i, 'Sep');
+  // Try native Date first
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+  // Try common formats like MMM YYYY, MM/YYYY
+  const m1 = s.match(/(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[\s.-]*([0-9]{4})/i);
+  if (m1) return new Date(`${m1[1]} 1, ${m1[2]}`);
+  const m2 = s.match(/([0-9]{1,2})[\/\-]([0-9]{4})/);
+  if (m2) return new Date(`${m2[1]}/1/${m2[2]}`);
+  return null;
+}
+
+function diffInMonths(a, b) {
+  const start = a instanceof Date ? a : parseDateFlexible(a);
+  const end = b ? (b instanceof Date ? b : parseDateFlexible(b)) : new Date();
+  if (!start || !end) return 0;
+  let months = (end.getFullYear() - start.getFullYear()) * 12 + (end.getMonth() - start.getMonth());
+  return Math.max(0, months);
+}
+
+function humanDurationFromMonths(months) {
+  const y = Math.floor(months / 12);
+  const m = months % 12;
+  const parts = [];
+  if (y) parts.push(`${y} yr${y > 1 ? 's' : ''}`);
+  if (m) parts.push(`${m} mo${m > 1 ? 's' : ''}`);
+  return parts.length ? parts.join(' ') : '0 mo';
+}
+
+function extractTotalYearsFromText(text) {
+  if (!text) return null;
+  const m = text.match(/(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs|year)\b/i);
+  return m ? parseFloat(m[1]) : null;
+}
+
+function normalizeSkillName(s) {
+  return safeString(s).toLowerCase().replace(/[^a-z0-9+#.]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // Enhanced comprehensive schema
 const getComprehensiveSchema = () => {
   return `{
@@ -227,7 +271,7 @@ CRITICAL INSTRUCTIONS:
 4. Infer logical details when context allows (e.g., seniority level from job titles)
 5. Parse dates in various formats (Jan 2020, 01/2020, January 2020, etc.)
 6. Separate responsibilities (daily tasks) from achievements (measurable results)
-7. Identify ALL technical skills mentioned throughout the resume (job descriptions, projects, etc.)
+7. Identify ALL technical skills mentioned throughout the resume (job descriptions, projects, etc.) and, when possible, include an estimated yearsOfExperience per skill derived from role durations and context
 8. Extract soft skills from context (leadership experience → leadership skill)
 9. Parse company information and role context
 10. Extract education details including GPA, coursework, honors if mentioned
@@ -236,6 +280,7 @@ CRITICAL INSTRUCTIONS:
 13. Extract contact information and social profiles completely
 14. Identify projects with technologies used and achievements
 15. Parse languages spoken and proficiency levels
+16. When dates are present for roles, compute duration in a human-friendly format (e.g., "2 yrs 3 mos") and mark isCurrentJob if end date is present/current
 
 SCHEMA TO FOLLOW EXACTLY:
 ${schema}
@@ -333,7 +378,20 @@ function mapAiProfileToCandidate(aiData) {
   const additionalInfo = safeObject(aiData.additionalInfo);
 
   // Enhanced technical skills mapping
-  const technicalSkills = [
+  // 1) Build a months-per-skill map from experience timelines
+  const skillMonths = new Map();
+  workExp.forEach(exp => {
+    const months = diffInMonths(exp.startDate, exp.endDate && exp.endDate !== 'present' ? exp.endDate : null);
+    const techs = safeArray(exp.technologies);
+    techs.forEach(t => {
+      const key = normalizeSkillName(t);
+      if (!key) return;
+      skillMonths.set(key, (skillMonths.get(key) || 0) + months);
+    });
+  });
+
+  // 2) Create a unified list of skills from AI sections + experience-derived
+  const skillsFromAI = [
     ...safeArray(technical.programmingLanguages),
     ...safeArray(technical.frameworks),
     ...safeArray(technical.databases),
@@ -341,11 +399,28 @@ function mapAiProfileToCandidate(aiData) {
     ...safeArray(technical.cloudPlatforms),
     ...safeArray(technical.operatingSystems),
     ...safeArray(technical.methodologies)
-  ].filter(Boolean).map(skill => ({
-    name: safeString(skill),
-    level: 'Advanced', // Default level
-    years: 1
-  }));
+  ].filter(Boolean);
+
+  const unifiedSkillNames = new Set([
+    ...skillsFromAI.map(normalizeSkillName),
+    ...Array.from(skillMonths.keys())
+  ].filter(Boolean));
+
+  const technicalSkills = Array.from(unifiedSkillNames).map(key => {
+    const months = skillMonths.get(key) || 0;
+    const years = Math.round((months / 12) * 10) / 10; // one decimal
+    const level = years >= 3 ? 'Advanced' : years >= 1 ? 'Intermediate' : 'Beginner';
+    return {
+      name: key,
+      level,
+      years
+    };
+  });
+
+  // Compute total experience
+  const totalYearsFromSummary = extractTotalYearsFromText(aiData?.professionalSummary?.totalExperience);
+  const totalMonthsFromExp = workExp.reduce((acc, exp) => acc + diffInMonths(exp.startDate, exp.endDate && exp.endDate !== 'present' ? exp.endDate : null), 0);
+  const totalExperience = totalYearsFromSummary != null ? `${totalYearsFromSummary} yrs` : humanDurationFromMonths(totalMonthsFromExp);
 
   return {
     // Basic Information
@@ -368,21 +443,29 @@ function mapAiProfileToCandidate(aiData) {
     },
     
     // Work Experience (Enhanced)
-    experience: workExp.map(exp => ({
-      title: safeString(exp.position),
-      company: safeString(exp.company),
-      location: safeString(exp.location),
-      startDate: exp.startDate ? new Date(exp.startDate) : null,
-      endDate: exp.endDate && exp.endDate !== 'present' ? new Date(exp.endDate) : null,
-      description: safeString([
-        ...safeArray(exp.responsibilities),
-        ...safeArray(exp.achievements)
-      ].join('. ')),
-      technologies: safeArray(exp.technologies),
-      isCurrentJob: Boolean(exp.isCurrentJob),
-      teamSize: safeString(exp.teamSize),
-      duration: safeString(exp.duration)
-    })),
+    experience: workExp.map(exp => {
+      const sDate = parseDateFlexible(exp.startDate);
+      const isCurrent = !(exp.endDate && /\b(past|ended)\b/i.test(String(exp.endDate))) && (exp.isCurrentJob || /present|current/i.test(String(exp.endDate)) || !exp.endDate);
+      const eDate = isCurrent ? null : parseDateFlexible(exp.endDate);
+      const months = diffInMonths(sDate, eDate || null);
+      return {
+        title: safeString(exp.position),
+        company: safeString(exp.company),
+        location: safeString(exp.location),
+        startDate: sDate || null,
+        endDate: eDate || null,
+        duration: exp.duration ? safeString(exp.duration) : humanDurationFromMonths(months),
+        isCurrentJob: Boolean(isCurrent),
+        responsibilities: safeArray(exp.responsibilities).map(safeString),
+        achievements: safeArray(exp.achievements).map(safeString),
+        description: safeString([
+          ...safeArray(exp.responsibilities),
+          ...safeArray(exp.achievements)
+        ].join('. ')),
+        technologies: safeArray(exp.technologies),
+        teamSize: safeString(exp.teamSize)
+      };
+    }),
     
     // Education (Enhanced)
     education: education.map(ed => ({
@@ -428,7 +511,7 @@ function mapAiProfileToCandidate(aiData) {
     
     // Additional Information
     additionalInfo: {
-      totalExperience: safeString(aiData.professionalSummary?.totalExperience),
+      totalExperience: safeString(totalExperience),
       careerLevel: safeString(aiData.professionalSummary?.careerLevel),
       availability: safeString(additionalInfo.availability),
       noticePeriod: safeString(additionalInfo.noticePeriod),
@@ -456,14 +539,15 @@ async function processResume(buffer, mimeType, originalName = '') {
 
     logger.info(`[resumeParser] Extracted ${rawText.length} characters from resume`);
     
-    // Analyze with enhanced AI
-    const aiProfile = await analyzeWithAI(rawText, true);
-    
-    // Map to candidate format
-    const candidate = mapAiProfileToCandidate(aiProfile);
-    
-    logger.info(`[resumeParser] Successfully parsed resume for: ${candidate.name}`);
-    
+    // Parse EXCLUSIVELY with OpenResume (vendor). If not present, throw a clear error.
+    const { parseOpenResumeText, parseRawOpenResumeText } = require('./openResumeParser');
+    const orProfile = await parseOpenResumeText(rawText); // AI-like mapped schema
+    const orRaw = await parseRawOpenResumeText(rawText);  // Raw OpenResume JSON
+    const candidate = mapAiProfileToCandidate(orProfile);
+    // Attach profiles so controller can save them
+    candidate.parsedProfile = orProfile;        // for UI hydration mapping
+    candidate.openResumeProfile = orRaw;        // raw JSON for future use/debug
+    logger.info(`[resumeParser] Parsed via OpenResume for: ${candidate.name}`);
     return candidate;
     
   } catch (error) {

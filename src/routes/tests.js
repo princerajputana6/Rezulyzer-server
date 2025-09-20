@@ -2,6 +2,7 @@ const express = require('express');
 const { body, query, param } = require('express-validator');
 const testController = require('../controllers/testController');
 const { protect } = require('../middleware/auth');
+const { candidateProtect } = require('../middleware/candidateAuth');
 const { requireRole, requireOwnerOrAdmin } = require('../middleware/roleAuth');
 const { handleValidationErrors } = require('../middleware/validation');
 const { apiLimiter, uploadLimiter } = require('../middleware/rateLimiter');
@@ -10,7 +11,13 @@ const { uploadResume } = require('../middleware/upload');
 const router = express.Router();
 
 // All routes require authentication
-router.use(protect);
+// Accept either a Candidate assessment session token (candidateProtect)
+// or a regular JWT via protect(). If candidateProtect finds a valid session,
+// it will set req.isCandidate and we skip protect(). Otherwise, we run protect().
+router.use(candidateProtect, (req, res, next) => {
+  if (req.isCandidate) return next();
+  return protect(req, res, next);
+});
 
 // Get all tests (with filtering, pagination)
 router.get('/',

@@ -50,6 +50,10 @@
     "winston": "^3.11.0",
     "hono": "^4.6.6",
     "jose": "^5.10.0",
+    "@langchain/openai": "^0.0.14",
+    "@langchain/core": "^0.1.17",
+    "langchain": "^0.1.25",
+    "zod": "^3.22.4",
     "xss-clean": "^0.1.4"
   },
   "devDependencies": {

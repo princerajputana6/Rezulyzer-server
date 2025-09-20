@@ -143,6 +143,131 @@ const candidateSchema = new mongoose.Schema({
     endDate: Date
   }],
   
+  // Parsed resume structured data (full details from parser)
+  parsedProfile: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+
+  // Raw OpenResume JSON (as returned by the OpenResume parser)
+  openResumeProfile: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+
+  // OpenResume-shaped structured data for first-class querying and UI consumption
+  openResumeData: {
+    basics: {
+      name: String,
+      firstName: String,
+      lastName: String,
+      email: String,
+      phone: String,
+      address: {
+        streetAddress: String,
+        city: String,
+        region: String,
+        postalCode: String,
+        country: String,
+      },
+      profiles: {
+        linkedin: String,
+        github: String,
+        portfolio: String,
+        website: String,
+        other: [String],
+      },
+      summary: String,
+      objective: String,
+    },
+    work: [{
+      company: String,
+      position: String,
+      title: String,
+      location: String,
+      startDate: Date,
+      endDate: Date,
+      isCurrent: { type: Boolean, default: false },
+      summary: String,
+      highlights: [String],
+      technologies: [String],
+      tools: [String],
+      teamSize: String,
+      reportingTo: String,
+    }],
+    education: [{
+      institution: String,
+      school: String,
+      university: String,
+      degree: String,
+      studyType: String,
+      field: String,
+      area: String,
+      location: String,
+      startDate: Date,
+      endDate: Date,
+      graduationDate: Date,
+      gpa: String,
+      courses: [String],
+      honors: [String],
+    }],
+    skills: [{
+      name: String,
+      level: String,
+      keywords: [String],
+      items: [String],
+    }],
+    projects: [{
+      name: String,
+      title: String,
+      description: String,
+      url: String,
+      link: String,
+      keywords: [String],
+      technologies: [String],
+      tools: [String],
+      achievements: [String],
+      startDate: Date,
+      endDate: Date,
+    }],
+    certifications: [{
+      name: String,
+      title: String,
+      issuer: String,
+      awarder: String,
+      date: Date,
+      url: String,
+      credentialId: String,
+    }],
+    languages: [{
+      language: String,
+      proficiency: String,
+    }],
+    publications: [{
+      title: String,
+      journal: String,
+      date: Date,
+      authors: [String],
+      url: String,
+    }],
+    volunteering: [{
+      organization: String,
+      role: String,
+      duration: String,
+      description: String,
+    }],
+    additionalInfo: {
+      availability: String,
+      noticePeriod: String,
+      expectedSalary: String,
+      willingToRelocate: String,
+      visaStatus: String,
+      references: [String],
+      hobbies: [String],
+      interests: [String],
+    },
+  },
+  
   // Resume Information
   resumeInfo: {
     fileName: String,
@@ -191,6 +316,25 @@ const candidateSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  // Assessment Authentication
+  assessmentPassword: {
+    type: String,
+    trim: true,
+  },
+  assessmentToken: {
+    type: String,
+    trim: true,
+  },
+  assessmentTokenExpiry: {
+    type: Date,
+  },
+  assessmentSessionToken: {
+    type: String,
+    trim: true,
+  },
+  assessmentSessionExpiry: {
+    type: Date,
+  },
 }, {
   timestamps: true,
   toJSON: { virtuals: true },
@@ -203,6 +347,7 @@ candidateSchema.index({ companyId: 1 });
 candidateSchema.index({ status: 1 });
 candidateSchema.index({ createdAt: -1 });
 candidateSchema.index({ 'assignedTests.testId': 1 });
+candidateSchema.index({ assessmentToken: 1 }); // For assessment login lookup
 
 // Pre-save hook to hash password
 candidateSchema.pre('save', async function(next) {

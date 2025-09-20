@@ -1,4 +1,4 @@
-const { generateQuestions, analyzeResume, suggestTests } = require('../config/ai');
+const aiService = require('../config/ai');
 const AuditLog = require('../models/AuditLog');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { HTTP_STATUS, MESSAGES } = require('../utils/constants');
@@ -23,7 +23,63 @@ const generateAIQuestions = asyncHandler(async (req, res) => {
 
   // If resume file is uploaded, extract text
   if (req.file) {
+    // If AI provider API key is missing, skip calling provider and use fallback immediately
+  if (!aiService.apiKey) {
+    logger.warn('AI provider API key missing; using fallback questions');
+    const c = parseInt(count) || 5;
+    const buildFallback = () => Array.from({ length: c }).map((_, i) => {
+      if (type === 'multiple_choice') {
+        return {
+          question: `(${subject}) Placeholder MCQ #${i + 1}: What is true about ${subject}?`,
+          options: ['Option A', 'Option B', 'Option C', 'Option D'],
+          correctAnswer: 'A',
+          explanation: `Basic ${subject} knowledge.`,
+          difficulty,
+          type: 'multiple_choice',
+          points: 10
+        };
+      } else if (type === 'essay') {
+        return {
+          question: `(${subject}) Output-based #${i + 1}: Provide the expected output for the given scenario.`,
+          explanation: `Key points about ${subject} output.`,
+          difficulty,
+          type: 'essay',
+          points: 10
+        };
+      } else if (type === 'coding') {
+        return {
+          question: `(${subject}) Practical #${i + 1}: Implement a function related to ${subject}.`,
+          starterCode: `function solve(input) {\n  // TODO: implement\n  return null;\n}`,
+          tests: [
+            { input: 'sample', expected: 'expected' }
+          ],
+          explanation: `Write clean code and handle edge-cases.`,
+          difficulty,
+          type: 'coding',
+          points: 10
+        };
+      }
+      return { question: `Placeholder Question #${i + 1}`, explanation: 'N/A', difficulty, type, points: 10 };
+    });
+
+    const placeholders = buildFallback();
     try {
+      await AuditLog.create({
+        userId: req.user?.id,
+        action: 'ai_questions_generated_fallback',
+        details: { count: placeholders.length, difficulty, type, subject, hasResume: !!resumeText },
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+    } catch {}
+
+    return res.json(createSuccessResponse('Questions generated successfully (fallback)', {
+      questions: placeholders,
+      metadata: { count: placeholders.length, difficulty, type, subject, generatedAt: new Date().toISOString(), fallback: true }
+    }));
+  }
+
+  try {
       const filePath = req.file.path;
       const fileContent = await fs.readFile(filePath, 'utf8');
       resumeText = fileContent;
@@ -39,14 +95,32 @@ const generateAIQuestions = asyncHandler(async (req, res) => {
   }
 
   try {
-    const questions = await generateQuestions({
-      prompt,
-      count: parseInt(count),
-      difficulty,
-      type,
-      subject,
-      resumeText
-    });
+    // Build a precise system + user prompt tailored to requested type
+    const c = parseInt(count);
+    const sys = 'You are an expert assessment generator. Always return STRICT JSON only, no commentary.';
+    const baseReq = `Generate exactly ${c} ${type} questions for subject "${subject}" with ${difficulty} difficulty.`;
+    let reqSpec = '';
+    if (type === 'multiple_choice') {
+      reqSpec = `Each item must include: "question" (string), "options" (array of 4 strings without leading labels), "correctAnswer" (one of "A","B","C","D"), "explanation" (string), "difficulty" ("easy"|"medium"|"hard"), "type": "multiple_choice", and optional "points" (number).`;
+    } else if (type === 'essay') {
+      reqSpec = `Each item must include: "question" (string), "explanation" (string with expected output or key points), "difficulty", "type": "essay", and optional "points" (number).`;
+    } else if (type === 'coding') {
+      reqSpec = `Each item must include: "question" (string), optional "starterCode" (string), "tests" (array of objects with "input" and "expected"), "explanation" (string), "difficulty", "type": "coding", and optional "points" (number).`;
+    } else {
+      reqSpec = `Return structured items with fields relevant to the question type and include a "type" field.`;
+    }
+
+    const finalPrompt = `${prompt}\n\n${baseReq}\n${reqSpec}\nReturn a JSON array only.`.slice(0, 1800); // safety cap
+
+    const messages = [
+      { role: 'system', content: sys },
+      { role: 'user', content: finalPrompt }
+    ];
+
+    const resp = await aiService.chatCompletion(messages, { max_tokens: 1800, temperature: 0.3 });
+    const text = resp?.choices?.[0]?.message?.content || '[]';
+    // Reuse parser from service
+    const questions = aiService.parseQuestions(text);
 
     await AuditLog.create({
       userId: req.user.id,
@@ -78,9 +152,66 @@ const generateAIQuestions = asyncHandler(async (req, res) => {
     );
   } catch (error) {
     logger.error('AI question generation failed:', error);
-    return res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR).json(
-      createErrorResponse('Failed to generate questions. Please try again.')
-    );
+    // Fallback: generate simple placeholder items to keep UI flowing
+    try {
+      const c = parseInt(count) || 5;
+      const placeholders = Array.from({ length: c }).map((_, i) => {
+        if (type === 'multiple_choice') {
+          return {
+            question: `(${subject}) Placeholder MCQ #${i + 1}: What is true about ${subject}?`,
+            options: ['Option A', 'Option B', 'Option C', 'Option D'],
+            correctAnswer: 'A',
+            explanation: `Basic ${subject} knowledge.`,
+            difficulty,
+            type: 'multiple_choice',
+            points: 10
+          };
+        } else if (type === 'essay') {
+          return {
+            question: `(${subject}) Output-based #${i + 1}: Provide the expected output for the given scenario.`,
+            explanation: `Key points about ${subject} output.`,
+            difficulty,
+            type: 'essay',
+            points: 10
+          };
+        } else if (type === 'coding') {
+          return {
+            question: `(${subject}) Practical #${i + 1}: Implement a function related to ${subject}.`,
+            starterCode: `function solve(input) {\n  // TODO: implement\n  return null;\n}`,
+            tests: [
+              { input: 'sample', expected: 'expected' }
+            ],
+            explanation: `Write clean code and handle edge-cases.`,
+            difficulty,
+            type: 'coding',
+            points: 10
+          };
+        }
+        return { question: `Placeholder Question #${i + 1}`, explanation: 'N/A', difficulty, type, points: 10 };
+      });
+
+      try {
+        await AuditLog.create({
+          userId: req.user?.id,
+          action: 'ai_questions_generated_fallback',
+          details: { count: placeholders.length, difficulty, type, subject, hasResume: !!resumeText },
+          ipAddress: req.ip,
+          userAgent: req.get('User-Agent')
+        });
+      } catch (auditErr) {
+        logger.warn('AuditLog fallback insert failed:', auditErr?.message);
+      }
+
+      return res.json(createSuccessResponse('Questions generated successfully (fallback)', {
+        questions: placeholders,
+        metadata: { count: placeholders.length, difficulty, type, subject, generatedAt: new Date().toISOString(), fallback: true }
+      }));
+    } catch (fallbackErr) {
+      logger.error('Fallback generation failed:', fallbackErr);
+      return res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR).json(
+        createErrorResponse('Failed to generate questions. Please try again.')
+      );
+    }
   }
 });
 
@@ -103,10 +234,7 @@ const analyzeResumeFile = asyncHandler(async (req, res) => {
     // Clean up uploaded file
     await fs.unlink(filePath);
 
-    const analysis = await analyzeResume({
-      resumeText,
-      jobDescription
-    });
+    const analysis = await aiService.analyzeResume(resumeText);
 
     await AuditLog.create({
       userId: req.user.id,
@@ -158,11 +286,7 @@ const suggestTestsForSkills = asyncHandler(async (req, res) => {
   } = req.body;
 
   try {
-    const suggestions = await suggestTests({
-      skills,
-      experience,
-      role
-    });
+    const suggestions = await aiService.generateTestSuggestions(skills, experience, role);
 
     await AuditLog.create({
       userId: req.user.id,
